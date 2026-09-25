@@ -107,6 +107,11 @@ API_KEY = load_key()
 
 _laya_router = None
 _laya_error = None
+# ThreadingHTTPServer handles each browser request in its own thread. Laya's
+# checkpoint loading and inference share device state and are not safe to overlap
+# (on macOS this can fail inside the AGX/Metal command buffer code).
+_laya_load_lock = threading.Lock()
+_laya_predict_lock = threading.Lock()
 
 
 def laya_router():
@@ -114,14 +119,19 @@ def laya_router():
     global _laya_router, _laya_error
     if _laya_router is not None or _laya_error is not None:
         return _laya_router
-    try:
-        from laya import Router
-        print("loading laya (first call warms the checkpoints)...")
-        _laya_router = Router(preload=True, max_loaded=3)
-        print("laya ready")
-    except Exception as exc:
-        _laya_error = f"laya unavailable: {exc}. Install it with: pip install laya"
-        print(_laya_error)
+    with _laya_load_lock:
+        # Several Laya agents can prime at the same time, so re-check after
+        # waiting for the thread that won the initialization race.
+        if _laya_router is not None or _laya_error is not None:
+            return _laya_router
+        try:
+            from laya import Router
+            print("loading laya (first call warms the checkpoints)...")
+            _laya_router = Router(preload=True, max_loaded=3)
+            print("laya ready")
+        except Exception as exc:
+            _laya_error = f"laya unavailable: {exc}. Install it with: pip install laya"
+            print(_laya_error)
     return _laya_router
 
 
@@ -195,8 +205,12 @@ class Handler(SimpleHTTPRequestHandler):
             # its built-in workflows. Custom questions match none, so it falls back to the
             # base English checkpoint -- near chance on typed decisions, and on the snake it
             # answered HARD_LEFT whatever the state. Ask for the typed-decisions one.
-            res = router.predict(incoming.get("state"), incoming.get("questions"),
-                                 model=incoming.get("laya_checkpoint") or LAYA_CHECKPOINT)
+            # The Router may be shared by several browser-side workers. Keep
+            # inference single-file so CPU/GPU backends cannot encode concurrent
+            # work into the same device command buffer.
+            with _laya_predict_lock:
+                res = router.predict(incoming.get("state"), incoming.get("questions"),
+                                     model=incoming.get("laya_checkpoint") or LAYA_CHECKPOINT)
         except Exception as exc:
             return self._json(500, {"error": f"laya predict failed: {exc}"})
         if not isinstance(res, dict):
